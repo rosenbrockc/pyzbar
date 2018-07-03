@@ -27,12 +27,14 @@ FOURCC = {
     'GRAY': 1497715271
 }
 
-def zbar_config(confstr):
+def zbar_config(scanner, confstr):
     """Calls :func:`zbar_parse_config` for the specified config string.
     """
     outs, outc, outv = c_int(), c_int(), c_int()
     ok = zbar_parse_config(confstr.encode("ASCII"), outs, outc, outv)
-    #print(ok==0, outs.value, outc.value, outv.value)
+    zbar_image_scanner_set_config(
+        scanner, outs.value, outc.value, outv.value
+    )
     return ok == 0
 
 @contextmanager
@@ -126,10 +128,6 @@ def decode(image, symbols=None, configs=None):
         raise PyZbarError('Unsupported bits-per-pixel [{0}]'.format(bpp))
 
     results = []
-    if configs is not None:
-        for confstr in configs:
-            assert zbar_config(confstr)
-            
     with zbar_image_scanner() as scanner:
         if symbols:
             # Disable all but the symbols of interest
@@ -147,6 +145,10 @@ def decode(image, symbols=None, configs=None):
                     scanner, symbol, ZBarConfig.CFG_ENABLE, 1
                 )
 
+        if configs is not None:
+            for confstr in configs:
+                assert zbar_config(scanner, confstr)
+                
         with zbar_image() as img:
             zbar_image_set_format(img, FOURCC['L800'])
             zbar_image_set_size(img, width, height)
