@@ -1,8 +1,9 @@
+from __future__ import print_function
+
 from collections import namedtuple
 from contextlib import contextmanager
-from ctypes import cast, c_void_p, string_at
+from ctypes import cast, c_void_p, string_at, c_int
 
-from .locations import bounding_box, convex_hull, Point, Rect
 from .pyzbar_error import PyZbarError
 from .wrapper import (
     zbar_image_scanner_set_config,
@@ -10,38 +11,46 @@ from .wrapper import (
     zbar_image_create, zbar_image_destroy, zbar_image_set_format,
     zbar_image_set_size, zbar_image_set_data, zbar_scan_image,
     zbar_image_first_symbol, zbar_symbol_get_data,
-    zbar_symbol_get_loc_size, zbar_symbol_get_loc_x, zbar_symbol_get_loc_y,
-    zbar_symbol_next, ZBarConfig, ZBarSymbol, EXTERNAL_DEPENDENCIES
+    zbar_symbol_next, ZBarConfig, ZBarSymbol, EXTERNAL_DEPENDENCIES,
+    zbar_parse_config, zbar_symbol_get_quality, zbar_set_verbosity
 )
 
-__all__ = ['decode', 'Point', 'Rect', 'Decoded', 'EXTERNAL_DEPENDENCIES']
+__all__ = ['decode', 'EXTERNAL_DEPENDENCIES']
 
 
-Decoded = namedtuple('Decoded', ['data', 'type', 'rect', 'polygon'])
+# Results of reading a barcode
+Decoded = namedtuple('Decoded', ['data', 'type', 'quality'])
 
 # ZBar's magic 'fourcc' numbers that represent image formats
-_FOURCC = {
+FOURCC = {
     'L800': 808466521,
     'GRAY': 1497715271
 }
 
-_RANGEFN = getattr(globals(), 'xrange', range)
-
+def zbar_config(confstr):
+    """Calls :func:`zbar_parse_config` for the specified config string.
+    """
+    outs, outc, outv = c_int(), c_int(), c_int()
+    ok = zbar_parse_config(confstr.encode("ASCII"), outs, outc, outv)
+    #print(ok==0, outs.value, outc.value, outv.value)
+    return ok == 0
 
 @contextmanager
-def _image():
+def zbar_image():
     """A context manager for `zbar_image`, created and destoyed by
     `zbar_image_create` and `zbar_image_destroy`.
 
+    Args:
+
     Yields:
-        POINTER(zbar_image): The created image
+        zbar_image: The created image
 
     Raises:
         PyZbarError: If the image could not be created.
     """
     image = zbar_image_create()
     if not image:
-        raise PyZbarError('Could not create zbar image')
+        raise PyZbarError('Could not create image')
     else:
         try:
             yield image
@@ -50,19 +59,21 @@ def _image():
 
 
 @contextmanager
-def _image_scanner():
+def zbar_image_scanner():
     """A context manager for `zbar_image_scanner`, created and destroyed by
     `zbar_image_scanner_create` and `zbar_image_scanner_destroy`.
 
+    Args:
+
     Yields:
-        POINTER(zbar_image_scanner): The created scanner
+        zbar_image_scanner: The created scanner
 
     Raises:
         PyZbarError: If the decoder could not be created.
     """
     scanner = zbar_image_scanner_create()
     if not scanner:
-        raise PyZbarError('Could not create image scanner')
+        raise PyZbarError('Could not create decoder')
     else:
         try:
             yield scanner
@@ -70,56 +81,21 @@ def _image_scanner():
             zbar_image_scanner_destroy(scanner)
 
 
-def _symbols_for_image(image):
-    """Generator of symbols.
+def decode(image, symbols=None, configs=None):
+    """Decodes datamatrix barcodes in `image`.
 
     Args:
-        image: `zbar_image`
-
-    Yields:
-        POINTER(zbar_symbol): Symbol
-    """
-    symbol = zbar_image_first_symbol(image)
-    while symbol:
-        yield symbol
-        symbol = zbar_symbol_next(symbol)
-
-
-def _decode_symbols(symbols):
-    """Generator of decoded symbol information.
-
-    Args:
-        symbols: iterable of instances of `POINTER(zbar_symbol)`
-
-    Yields:
-        Decoded: decoded symbol
-    """
-    for symbol in symbols:
-        data = string_at(zbar_symbol_get_data(symbol))
-        # The 'type' int in a value in the ZBarSymbol enumeration
-        symbol_type = ZBarSymbol(symbol.contents.type).name
-        polygon = convex_hull(
-            (
-                zbar_symbol_get_loc_x(symbol, index),
-                zbar_symbol_get_loc_y(symbol, index)
-            )
-            for index in _RANGEFN(zbar_symbol_get_loc_size(symbol))
-        )
-
-        yield Decoded(
-            data=data,
-            type=symbol_type,
-            rect=bounding_box(polygon),
-            polygon=polygon
-        )
-
-
-def _pixel_data(image):
-    """Returns (pixels, width, height)
+        image: `numpy.ndarray`, `PIL.Image` or tuple (pixels, width, height)
+        symbols (ZBarSymbol): the symbol types to decode; if `None`, use
+            `zbar`'s default behaviour, which (I think) is to decode all
+            symbol types.
+        configs (list): specify a list of configuration strings that should be
+          parsed. See `ZBar/zbar/config.c`.
 
     Returns:
-        :obj: `tuple` (pixels, width, height)
+        :obj:`list` of :obj:`Decoded`: The values decoded from barcodes.
     """
+
     # Test for PIL.Image and numpy.ndarray without requiring that cv2 or PIL
     # are installed.
     if 'PIL.' in str(type(image)):
@@ -144,43 +120,17 @@ def _pixel_data(image):
         # image should be a tuple (pixels, width, height)
         pixels, width, height = image
 
-        # Check dimensions
-        if 0 != len(pixels) % (width * height):
-            raise PyZbarError((
-                    'Inconsistent dimensions: image data of {0} bytes is not '
-                    'divisible by (width x height = {1})'
-                ).format(len(pixels), (width * height))
-            )
-
     # Compute bits-per-pixel
-    bpp = 8 * len(pixels) // (width * height)
+    bpp = 8 * len(pixels) / (width * height)
     if 8 != bpp:
-        raise PyZbarError(
-            'Unsupported bits-per-pixel [{0}]. Only [8] is supported.'.format(
-                bpp
-            )
-        )
-
-    return pixels, width, height
-
-
-def decode(image, symbols=None, scan_locations=False):
-    """Decodes datamatrix barcodes in `image`.
-
-    Args:
-        image: `numpy.ndarray`, `PIL.Image` or tuple (pixels, width, height)
-        symbols (ZBarSymbol): the symbol types to decode; if `None`, uses
-            `zbar`'s default behaviour, which is to decode all symbol types.
-        scan_locations (bool): If `True`, results will include scan
-            locations.
-
-    Returns:
-        :obj:`list` of :obj:`Decoded`: The values decoded from barcodes.
-    """
-    pixels, width, height = _pixel_data(image)
+        raise PyZbarError('Unsupported bits-per-pixel [{0}]'.format(bpp))
 
     results = []
-    with _image_scanner() as scanner:
+    if configs is not None:
+        for confstr in configs:
+            assert zbar_config(confstr)
+            
+    with zbar_image_scanner() as scanner:
         if symbols:
             # Disable all but the symbols of interest
             disable = set(ZBarSymbol).difference(symbols)
@@ -196,14 +146,26 @@ def decode(image, symbols=None, scan_locations=False):
                 zbar_image_scanner_set_config(
                     scanner, symbol, ZBarConfig.CFG_ENABLE, 1
                 )
-        with _image() as img:
-            zbar_image_set_format(img, _FOURCC['L800'])
+
+        with zbar_image() as img:
+            zbar_image_set_format(img, FOURCC['L800'])
             zbar_image_set_size(img, width, height)
             zbar_image_set_data(img, cast(pixels, c_void_p), len(pixels), None)
             decoded = zbar_scan_image(scanner, img)
             if decoded < 0:
                 raise PyZbarError('Unsupported image format')
             else:
-                results.extend(_decode_symbols(_symbols_for_image(img)))
+                symbol = zbar_image_first_symbol(img)
+                while symbol:
+                    data = string_at(zbar_symbol_get_data(symbol))
+                    symbol_type = ZBarSymbol(symbol.contents.value).name
+                    quality = zbar_symbol_get_quality(symbol)
+                    results.append(Decoded(
+                        data=data,
+                        type=symbol_type,
+                        quality=quality
+                    ))
+
+                    symbol = zbar_symbol_next(symbol)
 
     return results

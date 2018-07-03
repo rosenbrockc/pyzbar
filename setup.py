@@ -23,7 +23,7 @@ def readme():
 setup_data = {
     'name': 'pyzbar',
     'version': pyzbar.__version__,
-    'author': 'Lawrence Hudson',
+    'author': 'Lawrence Hudson, Conrad Rosenbrock',
     'author_email': 'quicklizard@googlemail.com',
     'url': URL,
     'license': 'MIT',
